@@ -1,7 +1,9 @@
+
 import html
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telegram import (
@@ -40,7 +42,6 @@ BOT_TOKEN = env_required("BOT_TOKEN")
 OWNER_ID = int(env_required("OWNER_ID"))
 ADMIN_CHAT_ID = int(env_required("ADMIN_CHAT_ID"))
 MAIN_CHAT_ID = int(env_required("MAIN_CHAT_ID"))
-
 DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
 
 DEFAULT_TEMPLATE = (
@@ -80,6 +81,7 @@ def load_data():
         saved = json.load(file)
 
     data = json.loads(json.dumps(DEFAULT_DATA))
+
     if isinstance(saved, dict):
         data.update(saved)
 
@@ -232,13 +234,9 @@ async def set_template(
 
     data = get_data(context)
 
-    # /шаблон ответом на фотографию
     if message.reply_to_message and message.reply_to_message.photo:
         photo_message = message.reply_to_message
-
-        data["template_photo"] = (
-            photo_message.photo[-1].file_id
-        )
+        data["template_photo"] = photo_message.photo[-1].file_id
 
         if photo_message.caption:
             data["template_text"] = photo_message.caption
@@ -247,13 +245,15 @@ async def set_template(
         await message.reply_text("✅ Шаблон сохранён.")
         return
 
-    # /шаблон Текст шаблона
-    text = " ".join(context.args).strip()
+    raw_text = message.text or ""
+    text = raw_text.partition(" ")[2].strip()
+
+    if text.startswith("@"):
+        text = text.partition(" ")[2].strip()
 
     if text:
         data["template_text"] = text
         save_data(data)
-
         context.chat_data["awaiting_template_photo"] = True
 
         await message.reply_text(
@@ -267,8 +267,7 @@ async def set_template(
         "Как изменить шаблон:\n\n"
         "1. Отправь /шаблон Текст сообщения.\n"
         "2. Следующим сообщением отправь фотографию.\n\n"
-        "Либо отправь фотографию с подписью, начинающейся "
-        "с /шаблон.\n\n"
+        "Либо ответь командой /шаблон на фотографию.\n\n"
         "Текущий шаблон: /шаблон_текущий"
     )
 
@@ -289,10 +288,8 @@ async def template_photo_handler(
     data = get_data(context)
     caption = message.caption or ""
 
-    # Фотография с подписью /шаблон Текст
     if caption.startswith("/шаблон"):
         text = caption[len("/шаблон"):].strip()
-
         data["template_photo"] = message.photo[-1].file_id
 
         if text:
@@ -304,11 +301,9 @@ async def template_photo_handler(
         )
         return
 
-    # Фотография после команды /шаблон Текст
     if context.chat_data.get("awaiting_template_photo"):
         data["template_photo"] = message.photo[-1].file_id
         save_data(data)
-
         context.chat_data.pop("awaiting_template_photo", None)
 
         await message.reply_text(
@@ -352,7 +347,6 @@ async def remove_template_photo(
     data = get_data(context)
     data["template_photo"] = None
     save_data(data)
-
     context.chat_data.pop("awaiting_template_photo", None)
 
     await message.reply_text(
@@ -387,7 +381,7 @@ async def add_admin(
 
     data = get_data(context)
     replied = message.reply_to_message
-    app_id, app = find_application(data, replied.message_id)
+    _, app = find_application(data, replied.message_id)
 
     target_id = app.get("user_id") if app else None
 
@@ -413,8 +407,6 @@ async def add_admin(
     data["admins"] = sorted(admins)
     save_data(data)
 
-    # Пытаемся уведомить пользователя, но права сохраняются,
-    # даже если он ещё не запускал бота.
     try:
         await context.bot.send_message(
             chat_id=target_id,
@@ -449,7 +441,7 @@ async def remove_admin(
 
     data = get_data(context)
     replied = message.reply_to_message
-    app_id, app = find_application(data, replied.message_id)
+    _, app = find_application(data, replied.message_id)
 
     target_id = app.get("user_id") if app else None
 
@@ -506,11 +498,8 @@ async def private_photo(
     if chat.type != ChatType.PRIVATE:
         return
 
-    data = get_data(context)
-
     if context.user_data.get("awaiting_photo"):
         context.user_data.pop("awaiting_photo", None)
-
         context.user_data["application_photo"] = (
             message.photo[-1].file_id
         )
@@ -539,7 +528,6 @@ async def private_text(
     data = get_data(context)
 
     if chat.type == ChatType.PRIVATE:
-        # Ответ пользователя в активном диалоге с администрацией
         if await relay_user_message(update, context):
             return
 
@@ -549,7 +537,7 @@ async def private_text(
             )
             return
 
-        nickname = message.text.strip()
+        nickname = (message.text or "").strip()
 
         if not nickname or nickname.startswith("/"):
             await message.reply_text(
@@ -562,10 +550,7 @@ async def private_text(
         if not photo_id:
             context.user_data.pop("awaiting_nickname", None)
             context.user_data["awaiting_photo"] = True
-
-            await message.reply_text(
-                "Сначала отправь фотографию."
-            )
+            await message.reply_text("Сначала отправь фотографию.")
             return
 
         app_id = int(data["next_application_id"])
@@ -638,7 +623,7 @@ async def private_text(
         await message.reply_text("Активный диалог не найден.")
         return
 
-    if message.text.startswith("/"):
+    if (message.text or "").startswith("/"):
         return
 
     try:
@@ -650,19 +635,18 @@ async def private_text(
     except TelegramError:
         await message.reply_text(
             "❌ Не удалось написать пользователю. "
-            "Возможно, он не запускал бота или заблокировал его."
+            "Возможно, он заблокировал бота."
         )
 
 
 async def relay_user_message(update, context):
     message = update.effective_message
     user = update.effective_user
+
     if not message or not user:
         return False
 
     data = get_data(context)
-
-    # Находим активный диалог по Telegram ID пользователя.
     active = None
 
     for key, app in data["applications"].items():
@@ -691,15 +675,15 @@ async def relay_user_message(update, context):
         parse_mode="HTML",
     )
 
-    # Копируем оригинал: сохраняются фотографии, документы,
-    # стикеры, голосовые сообщения и другие поддерживаемые типы.
     await context.bot.copy_message(
         chat_id=ADMIN_CHAT_ID,
         from_chat_id=user.id,
         message_id=message.message_id,
     )
 
-    await message.reply_text("✅ Сообщение передано администрации.")
+    await message.reply_text(
+        "✅ Сообщение передано администрации."
+    )
     return True
 
 
@@ -708,10 +692,9 @@ async def other_private_message(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     message = update.effective_message
-    user = update.effective_user
     chat = update.effective_chat
 
-    if not message or not user or not chat:
+    if not message or not chat:
         return
 
     if chat.type != ChatType.PRIVATE:
@@ -778,37 +761,61 @@ async def application_callback(
             return
 
         if action == "accept":
+            # Одно вступление, срок действия 24 часа.
             try:
                 invite = await context.bot.create_chat_invite_link(
-    chat_id=MAIN_CHAT_ID,
-    member_limit=1,
-    expire_date=datetime.now(timezone.utc) + timedelta(days=1),
-)
-
+                    chat_id=MAIN_CHAT_ID,
                     name=f"application-{app_id}",
+                    member_limit=1,
+                    expire_date=(
+                        datetime.now(timezone.utc)
+                        + timedelta(days=1)
+                    ),
                 )
+            except TelegramError:
+                logger.exception("Не удалось создать ссылку")
 
+                await query.message.reply_text(
+                    "❌ Не удалось создать ссылку. "
+                    "Проверь права бота в приватной беседе."
+                )
+                return
+
+            app["invite_link"] = invite.invite_link
+
+            try:
                 await context.bot.send_message(
                     chat_id=app["user_id"],
                     text=(
                         "✅ Твоя заявка одобрена!\n\n"
-                        "Вот одноразовая ссылка для вступления:\n"
+                        "Вот одноразовая ссылка для вступления "
+                        "(действует 24 часа):\n"
                         f"{invite.invite_link}\n\n"
                         "Не передавай ссылку другим пользователям!"
                     ),
                 )
-
-                app["status"] = "accepted"
-                app["invite_link"] = invite.invite_link
-
             except TelegramError:
-                logger.exception("Не удалось принять заявку")
+                # Сохраняем ссылку, чтобы администрация могла
+                # вручную передать её заявителю.
+                app["status"] = "accepted"
+                app["processed_by"] = query.from_user.id
+                save_data(data)
 
                 await query.message.reply_text(
-                    "❌ Не удалось создать ссылку или отправить её. "
-                    "Проверь права бота в беседе и доступность пользователя."
+                    "⚠️ Заявка одобрена, но бот не смог отправить "
+                    "ссылку пользователю. Ссылка сохранена в данных "
+                    "заявки. Проверь, доступен ли пользователю бот."
+                )
+
+                await query.message.edit_reply_markup(
+                    reply_markup=application_keyboard(
+                        app_id,
+                        status="accepted",
+                    )
                 )
                 return
+
+            app["status"] = "accepted"
 
         else:
             app["status"] = "rejected"
@@ -818,7 +825,7 @@ async def application_callback(
                     chat_id=app["user_id"],
                     text=(
                         "❌ К сожалению, твоя заявка "
-                        "на вступление отклонена Администрацией."
+                        "на вступление отклонена администрацией."
                     ),
                 )
             except TelegramError:
@@ -865,7 +872,8 @@ async def application_callback(
 
         await query.message.reply_text(
             f"💬 Диалог по заявке №{app_id} активирован.\n"
-            "Отправляй сообщения в админ-чат — бот передаст их пользователю.\n"
+            "Отправляй сообщения в админ-чат — бот передаст их "
+            "пользователю.\n"
             "Для завершения отправь /конец."
         )
 
@@ -911,6 +919,34 @@ async def end_contact(
 
 
 # ============================================================
+# RUSSIAN COMMAND ROUTER
+# Русские команды обрабатываются вручную, поскольку Telegram
+# поддерживает в именах команд только латинские буквы, цифры и _.
+# ============================================================
+
+async def russian_command_router(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    command = text.split(maxsplit=1)[0].split("@")[0].lower()
+
+    if command == "/шаблон":
+        await set_template(update, context)
+    elif command == "/шаблон_текущий":
+        await show_template(update, context)
+    elif command == "/безфото":
+        await remove_template_photo(update, context)
+    elif command == "/конец":
+        await end_contact(update, context)
+
+
+# ============================================================
 # ERROR HANDLER
 # ============================================================
 
@@ -932,18 +968,23 @@ def main():
 
     application.bot_data["data"] = data
 
-    # Команды
+    # Английские команды Telegram
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("шаблон", set_template))
-    application.add_handler(
-        CommandHandler("шаблон_текущий", show_template)
-    )
-    application.add_handler(
-        CommandHandler("безфото", remove_template_photo)
-    )
     application.add_handler(CommandHandler("add", add_admin))
     application.add_handler(CommandHandler("del", remove_admin))
-    application.add_handler(CommandHandler("конец", end_contact))
+
+    # Русские команды, включая команды с аргументами
+    application.add_handler(
+        MessageHandler(
+            filters.Chat(ADMIN_CHAT_ID)
+            & filters.TEXT
+            & filters.Regex(
+                r"^/(?:шаблон(?:_текущий)?|безфото|конец)"
+                r"(?:@\w+)?(?:\s|$)"
+            ),
+            russian_command_router,
+        )
+    )
 
     application.add_handler(
         CallbackQueryHandler(
@@ -952,7 +993,7 @@ def main():
         )
     )
 
-    # Фотографии: личные сообщения и настройка шаблона
+    # Фотографии пользователей
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.PHOTO,
@@ -960,6 +1001,7 @@ def main():
         )
     )
 
+    # Фотографии для шаблона в админ-чате
     application.add_handler(
         MessageHandler(
             filters.Chat(ADMIN_CHAT_ID) & filters.PHOTO,
@@ -967,7 +1009,7 @@ def main():
         )
     )
 
-    # Текстовые сообщения в личном чате с ботом
+    # Текст пользователей и администраторов
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
@@ -977,7 +1019,6 @@ def main():
         )
     )
 
-    # Текстовые сообщения администраторов
     application.add_handler(
         MessageHandler(
             filters.Chat(ADMIN_CHAT_ID)
@@ -987,7 +1028,7 @@ def main():
         )
     )
 
-    # Остальные типы сообщений пользователя
+    # Другие типы личных сообщений
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
@@ -1001,6 +1042,7 @@ def main():
     application.add_error_handler(error_handler)
 
     logger.info("Бот заявок запускается.")
+
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
@@ -1008,3 +1050,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
