@@ -1,4 +1,3 @@
-
 import html
 import json
 import logging
@@ -58,6 +57,7 @@ DEFAULT_DATA = {
     "admin_message_map": {},
     "next_application_id": 1,
     "blocked_users": [],
+    "user_blocks": {},
 }
 
 
@@ -89,6 +89,91 @@ def load_data():
         data.setdefault(key, value)
 
     return data
+
+
+
+def get_user_block(data, user_id):
+    """Возвращает действующую блокировку или None."""
+    user_id = int(user_id)
+
+    # Старый список blocked_users сохраняем как бессрочные блокировки.
+    if user_id in {int(x) for x in data.get("blocked_users", [])}:
+        return {"until": None, "reason": "Бессрочная блокировка"}
+
+    blocks = data.setdefault("user_blocks", {})
+    block = blocks.get(str(user_id))
+    if not block:
+        return None
+
+    until_text = block.get("until")
+    if not until_text:
+        return block
+
+    try:
+        until = datetime.fromisoformat(until_text)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        # Повреждённая дата не должна случайно снять блокировку.
+        return block
+
+    if datetime.now(timezone.utc) >= until:
+        blocks.pop(str(user_id), None)
+        save_data(data)
+        return None
+
+    return block
+
+
+def apply_user_block(data, user_id, hours=24, reason="Отказ в заявке", blocked_by=None):
+    """Создаёт временную или бессрочную блокировку подачи заявок."""
+    user_id = int(user_id)
+    data.setdefault("user_blocks", {})
+
+    if hours is None:
+        until = None
+        until_text = None
+    else:
+        until = datetime.now(timezone.utc) + timedelta(hours=hours)
+        until_text = until.isoformat()
+
+    data["user_blocks"][str(user_id)] = {
+        "until": until_text,
+        "reason": reason,
+        "blocked_by": int(blocked_by) if blocked_by is not None else None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_data(data)
+    return data["user_blocks"][str(user_id)]
+
+
+def format_block_expiry(block):
+    until_text = block.get("until")
+    if not until_text:
+        return "навсегда"
+    try:
+        until = datetime.fromisoformat(until_text)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return until.astimezone().strftime("%d.%m.%Y в %H:%M")
+    except (TypeError, ValueError):
+        return "срок неизвестен"
+
+
+def get_replied_target(data, message):
+    """Определяет пользователя по ответу на заявку или сообщение."""
+    replied = message.reply_to_message if message else None
+    if not replied:
+        return None
+
+    _, app = find_application(data, replied.message_id)
+    if app:
+        return int(app.get("user_id"))
+
+    if replied.from_user:
+        return int(replied.from_user.id)
+
+    return None
 
 
 def get_data(context):
@@ -196,9 +281,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = get_data(context)
 
-    if user.id in {int(x) for x in data["blocked_users"]}:
+    block = get_user_block(data, user.id)
+    if block:
         await message.reply_text(
-            "❌ Вы не можете подать заявку через этого бота."
+            "❌ Подача заявок для тебя временно ограничена.\n"
+            f"Причина: {esc(block.get('reason', 'не указана'))}\n"
+            f"Блокировка действует до: {format_block_expiry(block)}."
         )
         return
 
@@ -498,6 +586,18 @@ async def private_photo(
     if chat.type != ChatType.PRIVATE:
         return
 
+    data = get_data(context)
+    block = get_user_block(data, user.id)
+    if block:
+        context.user_data.pop("awaiting_photo", None)
+        context.user_data.pop("awaiting_nickname", None)
+        context.user_data.pop("application_photo", None)
+        await message.reply_text(
+            "❌ Ты не можешь подать заявку. "
+            f"Блокировка действует до: {format_block_expiry(block)}."
+        )
+        return
+
     if context.user_data.get("awaiting_photo"):
         context.user_data.pop("awaiting_photo", None)
         context.user_data["application_photo"] = (
@@ -528,6 +628,16 @@ async def private_text(
     data = get_data(context)
 
     if chat.type == ChatType.PRIVATE:
+        block = get_user_block(data, user.id)
+        if block:
+            context.user_data.pop("awaiting_photo", None)
+            context.user_data.pop("awaiting_nickname", None)
+            context.user_data.pop("application_photo", None)
+            await message.reply_text(
+                "❌ Ты не можешь подать заявку. "
+                f"Блокировка действует до: {format_block_expiry(block)}."
+            )
+            return
         if await relay_user_message(update, context):
             return
 
@@ -603,7 +713,7 @@ async def private_text(
         context.user_data.pop("application_photo", None)
 
         await message.reply_text(
-            "✅ Твоя заявка отправлена администрации на рассмотрение."
+            "✅ Твоя заявка отправлена Администрации на рассмотрение."
         )
         return
 
@@ -629,7 +739,7 @@ async def private_text(
     try:
         await context.bot.send_message(
             chat_id=app["user_id"],
-            text=f"💬 Сообщение от администрации:\n\n{message.text}",
+            text=f"💬 Сообщение от Администрации:\n\n{message.text}",
         )
         await message.reply_text("✅ Сообщение отправлено.")
     except TelegramError:
@@ -682,7 +792,7 @@ async def relay_user_message(update, context):
     )
 
     await message.reply_text(
-        "✅ Сообщение передано администрации."
+        "✅ Сообщение передано Администрации."
     )
     return True
 
@@ -819,13 +929,37 @@ async def application_callback(
 
         else:
             app["status"] = "rejected"
+            # После отказа повторная подача заявки запрещена на 24 часа.
+            # Не сокращаем уже действующую более длительную блокировку.
+            existing_block = get_user_block(data, app["user_id"])
+            should_apply_rejection_block = existing_block is None
+            if existing_block and existing_block.get("until"):
+                try:
+                    current_until = datetime.fromisoformat(existing_block["until"])
+                    if current_until.tzinfo is None:
+                        current_until = current_until.replace(tzinfo=timezone.utc)
+                    should_apply_rejection_block = (
+                        current_until < datetime.now(timezone.utc) + timedelta(hours=24)
+                    )
+                except (TypeError, ValueError):
+                    should_apply_rejection_block = False
+
+            if should_apply_rejection_block:
+                apply_user_block(
+                    data,
+                    app["user_id"],
+                    hours=24,
+                    reason=f"Заявка №{app_id} отклонена",
+                    blocked_by=query.from_user.id,
+                )
 
             try:
                 await context.bot.send_message(
                     chat_id=app["user_id"],
                     text=(
                         "❌ К сожалению, твоя заявка "
-                        "на вступление отклонена администрацией."
+                        "на вступление отклонена Администрацией.\n\n"
+                        "Повторно подать заявку можно через 24 часа."
                     ),
                 )
             except TelegramError:
@@ -910,12 +1044,136 @@ async def end_contact(
         try:
             await context.bot.send_message(
                 chat_id=app["user_id"],
-                text="ℹ️ Диалог с администрацией завершён.",
+                text="ℹ️ Диалог с Администрацией завершён.",
             )
         except TelegramError:
             pass
 
     await message.reply_text("✅ Диалог завершён.")
+
+
+
+async def block_applications_command(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not in_admin_chat(update):
+        return
+
+    data = get_data(context)
+    if not has_access(user.id, data):
+        await message.reply_text("❌ Доступ запрещён.")
+        return
+
+    target_id = get_replied_target(data, message)
+    if target_id is None:
+        await message.reply_text(
+            "Ответь командой /банзаявки на сообщение пользователя "
+            "или на карточку его заявки.\n"
+            "Можно указать срок в часах: /банзаявки 48\n"
+            "Для бессрочной блокировки: /банзаявки навсегда"
+        )
+        return
+
+    if target_id == OWNER_ID:
+        await message.reply_text("❌ Нельзя заблокировать владельца бота.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    duration = args[1].strip().lower() if len(args) > 1 else "24"
+    if duration in ("навсегда", "вечная", "бессрочно"):
+        hours = None
+    else:
+        try:
+            hours = int(duration)
+            if hours < 1 or hours > 8760:
+                raise ValueError
+        except ValueError:
+            await message.reply_text(
+                "❌ Укажи срок от 1 до 8760 часов или слово «навсегда»."
+            )
+            return
+
+    block = apply_user_block(
+        data,
+        target_id,
+        hours=hours,
+        reason="Блокировка администрацией",
+        blocked_by=user.id,
+    )
+    await message.reply_text(
+        f"🔒 Подача заявок для пользователя <code>{target_id}</code> "
+        f"заблокирована.\n"
+        f"Срок: {format_block_expiry(block)}.",
+        parse_mode="HTML",
+    )
+
+
+async def unblock_applications_command(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not in_admin_chat(update):
+        return
+
+    data = get_data(context)
+    if not has_access(user.id, data):
+        await message.reply_text("❌ Доступ запрещён.")
+        return
+
+    target_id = get_replied_target(data, message)
+    if target_id is None:
+        await message.reply_text(
+            "Ответь командой /разбанзаявки на сообщение пользователя "
+            "или на карточку его заявки."
+        )
+        return
+
+    data.setdefault("user_blocks", {}).pop(str(target_id), None)
+    data["blocked_users"] = [
+        int(x) for x in data.get("blocked_users", [])
+        if int(x) != target_id
+    ]
+    save_data(data)
+    await message.reply_text(
+        f"🔓 Блокировка подачи заявок для пользователя "
+        f"<code>{target_id}</code> снята.",
+        parse_mode="HTML",
+    )
+
+
+async def list_application_bans(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not in_admin_chat(update):
+        return
+
+    data = get_data(context)
+    if not has_access(user.id, data):
+        await message.reply_text("❌ Доступ запрещён.")
+        return
+
+    active = []
+    all_ids = set(str(int(x)) for x in data.get("blocked_users", []))
+    all_ids.update(data.get("user_blocks", {}).keys())
+
+    for user_id_text in sorted(all_ids, key=lambda x: int(x)):
+        user_id = int(user_id_text)
+        block = get_user_block(data, user_id)
+        if block:
+            active.append(
+                f"• <code>{user_id}</code> — "
+                f"{esc(format_block_expiry(block))}; "
+                f"{esc(block.get('reason', 'причина не указана'))}"
+            )
+
+    if not active:
+        await message.reply_text("✅ Сейчас нет заблокированных пользователей.")
+        return
+
+    await message.reply_text(
+        "🔒 <b>Заблокированные пользователи:</b>\n\n"
+        + "\n".join(active),
+        parse_mode="HTML",
+    )
 
 
 # ============================================================
@@ -944,6 +1202,12 @@ async def russian_command_router(
         await remove_template_photo(update, context)
     elif command == "/конец":
         await end_contact(update, context)
+    elif command == "/банзаявки":
+        await block_applications_command(update, context)
+    elif command == "/разбанзаявки":
+        await unblock_applications_command(update, context)
+    elif command == "/списокбанов":
+        await list_application_bans(update, context)
 
 
 # ============================================================
@@ -979,7 +1243,8 @@ def main():
             filters.Chat(ADMIN_CHAT_ID)
             & filters.TEXT
             & filters.Regex(
-                r"^/(?:шаблон(?:_текущий)?|безфото|конец)"
+                r"^/(?:шаблон(?:_текущий)?|безфото|конец|"
+                r"банзаявки|разбанзаявки|списокбанов)"
                 r"(?:@\w+)?(?:\s|$)"
             ),
             russian_command_router,
@@ -1050,4 +1315,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
