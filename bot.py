@@ -58,6 +58,8 @@ DEFAULT_DATA = {
     "next_application_id": 1,
     "blocked_users": [],
     "user_blocks": {},
+    "admin_log": [],
+    "last_submission_at": {},
 }
 
 
@@ -90,6 +92,48 @@ def load_data():
 
     return data
 
+
+
+def log_action(data, actor_id, action, target_id=None, app_id=None, details=None):
+    """Сохраняет историю действий Администрации в data.json."""
+    entry = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "actor_id": int(actor_id) if actor_id is not None else None,
+        "action": str(action),
+        "target_id": int(target_id) if target_id is not None else None,
+        "app_id": int(app_id) if app_id is not None else None,
+        "details": str(details) if details else None,
+    }
+    log = data.setdefault("admin_log", [])
+    log.append(entry)
+    # Ограничиваем размер файла, оставляя последние 500 событий.
+    del log[:-500]
+    save_data(data)
+
+
+def user_application_history(data, user_id, current_app_id=None):
+    apps = [
+        app for app in data.get("applications", {}).values()
+        if int(app.get("user_id", 0)) == int(user_id)
+        and str(app.get("id")) != str(current_app_id)
+    ]
+    total = len(apps)
+    accepted = sum(app.get("status") == "accepted" for app in apps)
+    rejected = sum(app.get("status") == "rejected" for app in apps)
+    pending = sum(app.get("status") == "pending" for app in apps)
+    last = max(apps, key=lambda a: a.get("created_at", ""), default=None)
+    last_text = "нет"
+    if last:
+        last_status = {"accepted": "одобрена", "rejected": "отклонена", "pending": "на рассмотрении"}.get(last.get("status"), last.get("status", "неизвестно"))
+        last_text = f"№{last.get('id', '?')} — {last_status}"
+    return f"📚 История: {total} предыдущих заявок (одобрено: {accepted}, отклонено: {rejected}, ожидают: {pending})\n🕘 Последняя: {last_text}"
+
+
+def pending_application_for_user(data, user_id):
+    for key, app in data.get("applications", {}).items():
+        if int(app.get("user_id", 0)) == int(user_id) and app.get("status") == "pending":
+            return int(key), app
+    return None, None
 
 
 def get_user_block(data, user_id):
@@ -201,28 +245,22 @@ def esc(value):
     return html.escape(str(value), quote=True)
 
 
-def application_keyboard(app_id, status="pending"):
+def application_keyboard(app_id, status="pending", has_invite=False):
     rows = []
 
     if status == "pending":
         rows.append([
-            InlineKeyboardButton(
-                "✅ Принять",
-                callback_data=f"app:accept:{app_id}",
-            ),
-            InlineKeyboardButton(
-                "❌ Отклонить",
-                callback_data=f"app:reject:{app_id}",
-            ),
+            InlineKeyboardButton("✅ Принять", callback_data=f"app:accept:{app_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"app:reject:{app_id}"),
+        ])
+    elif status == "accepted" and has_invite:
+        rows.append([
+            InlineKeyboardButton("🚫 Отозвать ссылку", callback_data=f"app:revoke:{app_id}"),
         ])
 
     rows.append([
-        InlineKeyboardButton(
-            "💬 Написать пользователю",
-            callback_data=f"app:contact:{app_id}",
-        )
+        InlineKeyboardButton("💬 Написать пользователю", callback_data=f"app:contact:{app_id}")
     ])
-
     return InlineKeyboardMarkup(rows)
 
 
@@ -295,11 +333,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_photo"] = True
 
     await send_template(chat.id, data, context)
-
-    await message.reply_text(
-        "📷 Отправь свою фотографию следующим сообщением. "
-        "После этого я попрошу твой никнейм."
-    )
 
 
 # ============================================================
@@ -493,6 +526,7 @@ async def add_admin(
     admins = {int(x) for x in data["admins"]}
     admins.add(target_id)
     data["admins"] = sorted(admins)
+    log_action(data, user.id, "admin_access_granted", target_id)
     save_data(data)
 
     try:
@@ -555,6 +589,7 @@ async def remove_admin(
         for x in data["admins"]
         if int(x) != target_id
     ]
+    log_action(data, user.id, "admin_access_revoked", target_id)
     save_data(data)
 
     try:
@@ -663,6 +698,33 @@ async def private_text(
             await message.reply_text("Сначала отправь фотографию.")
             return
 
+        existing_id, existing_app = pending_application_for_user(data, user.id)
+        if existing_app:
+            context.user_data.pop("awaiting_nickname", None)
+            context.user_data.pop("application_photo", None)
+            await message.reply_text(
+                f"⏳ У тебя уже есть заявка №{existing_id} на рассмотрении. "
+                "Дождись решения Администрации."
+            )
+            return
+
+        # Защита от повторной отправки заявок: не чаще одной заявки за 60 секунд.
+        now = datetime.now(timezone.utc)
+        previous_time = data.setdefault("last_submission_at", {}).get(str(user.id))
+        if previous_time:
+            try:
+                previous_dt = datetime.fromisoformat(previous_time)
+                if previous_dt.tzinfo is None:
+                    previous_dt = previous_dt.replace(tzinfo=timezone.utc)
+                seconds_left = 60 - (now - previous_dt).total_seconds()
+                if seconds_left > 0:
+                    await message.reply_text(
+                        f"⏳ Подожди ещё {int(seconds_left) + 1} сек. перед повторной подачей."
+                    )
+                    return
+            except (TypeError, ValueError):
+                pass
+
         app_id = int(data["next_application_id"])
         data["next_application_id"] = app_id + 1
 
@@ -676,7 +738,9 @@ async def private_text(
             "status": "pending",
             "admin_message_id": None,
             "contact_mode": False,
+            "created_at": now.isoformat(),
         }
+        data["last_submission_at"][str(user.id)] = now.isoformat()
 
         data["applications"][str(app_id)] = app
         save_data(data)
@@ -694,7 +758,8 @@ async def private_text(
             f'<a href="tg://user?id={user.id}">'
             f"{esc(user.full_name)}</a>\n"
             f"🔗 Username: {esc(username)}\n"
-            f"🆔 ID пользователя: <code>{user.id}</code>"
+            f"🆔 ID пользователя: <code>{user.id}</code>\n\n"
+            f"{esc(user_application_history(data, user.id, app_id))}"
         )
 
         sent = await context.bot.send_photo(
@@ -832,182 +897,225 @@ async def application_callback(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
-
     if not query or not query.message:
         return
 
     data = get_data(context)
-
     if query.message.chat.id != ADMIN_CHAT_ID:
         await query.answer()
         return
-
     if not has_access(query.from_user.id, data):
-        await query.answer(
-            "❌ Нет доступа к управлению заявками.",
-            show_alert=True,
-        )
+        await query.answer("❌ Нет доступа к управлению заявками.", show_alert=True)
         return
-
-    await query.answer()
 
     try:
         _, action, app_id_text = query.data.split(":")
         app_id = int(app_id_text)
     except (ValueError, AttributeError):
+        await query.answer()
         return
 
     app = data["applications"].get(str(app_id))
-
     if not app:
-        await query.message.reply_text("Заявка не найдена.")
+        await query.answer("Заявка не найдена.", show_alert=True)
         return
 
-    if action in ("accept", "reject"):
-        if app["status"] != "pending":
-            await query.message.reply_text(
-                "Эта заявка уже обработана."
+    if action == "reject":
+        await query.answer()
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏱ 24 часа", callback_data=f"app:reject24:{app_id}"),
+             InlineKeyboardButton("📅 7 дней", callback_data=f"app:reject168:{app_id}")],
+            [InlineKeyboardButton("♾ Навсегда", callback_data=f"app:rejectperm:{app_id}"),
+             InlineKeyboardButton("↩️ Отмена", callback_data=f"app:rejectcancel:{app_id}")],
+        ])
+        await query.message.reply_text(
+            f"Выбери срок блокировки подачи заявок для пользователя по заявке №{app_id}:",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "rejectcancel":
+        await query.answer("Отменено.")
+        try:
+            await query.message.delete()
+        except TelegramError:
+            pass
+        return
+
+    if action == "revoke":
+        await query.answer()
+        invite_link = app.get("invite_link")
+        if app.get("status") != "accepted" or not invite_link:
+            await query.message.reply_text("❌ Для этой заявки нет активной ссылки для отзыва.")
+            return
+        try:
+            await context.bot.revoke_chat_invite_link(
+                chat_id=MAIN_CHAT_ID,
+                invite_link=invite_link,
             )
+        except TelegramError:
+            logger.exception("Не удалось отозвать ссылку приглашения")
+            await query.message.reply_text(
+                "❌ Не удалось отозвать ссылку. Проверь права бота и не была ли ссылка уже использована/отозвана."
+            )
+            return
+        app["invite_revoked"] = True
+        app["invite_revoked_at"] = datetime.now(timezone.utc).isoformat()
+        app["invite_revoked_by"] = query.from_user.id
+        log_action(data, query.from_user.id, "invite_revoked", app.get("user_id"), app_id)
+        save_data(data)
+        await query.message.edit_reply_markup(
+            reply_markup=application_keyboard(app_id, status="accepted", has_invite=False)
+        )
+        await query.message.reply_text(f"🚫 Ссылка для заявки №{app_id} отозвана.")
+        try:
+            await context.bot.send_message(
+                chat_id=app["user_id"],
+                text="ℹ️ Ранее выданная ссылка для вступления отозвана Администрацией. Если это ошибка, свяжись с Администрацией.",
+            )
+        except TelegramError:
+            pass
+        return
+
+    if action in ("accept", "reject24", "reject168", "rejectperm"):
+        await query.answer()
+        if app.get("status") != "pending":
+            await query.message.reply_text("Эта заявка уже обработана.")
             return
 
         if action == "accept":
-            # Одно вступление, срок действия 24 часа.
             try:
                 invite = await context.bot.create_chat_invite_link(
                     chat_id=MAIN_CHAT_ID,
                     name=f"application-{app_id}",
                     member_limit=1,
-                    expire_date=(
-                        datetime.now(timezone.utc)
-                        + timedelta(days=1)
-                    ),
+                    expire_date=datetime.now(timezone.utc) + timedelta(days=1),
                 )
             except TelegramError:
                 logger.exception("Не удалось создать ссылку")
-
                 await query.message.reply_text(
-                    "❌ Не удалось создать ссылку. "
-                    "Проверь права бота в приватной беседе."
+                    "❌ Не удалось создать ссылку. Проверь права бота в главной беседе."
                 )
                 return
 
             app["invite_link"] = invite.invite_link
-
+            app["invite_revoked"] = False
+            app["status"] = "accepted"
+            app["processed_by"] = query.from_user.id
+            app["processed_at"] = datetime.now(timezone.utc).isoformat()
             try:
                 await context.bot.send_message(
                     chat_id=app["user_id"],
                     text=(
                         "✅ Твоя заявка одобрена!\n\n"
-                        "Вот одноразовая ссылка для вступления "
-                        "(действует 24 часа):\n"
+                        "Вот одноразовая ссылка для вступления (действует 24 часа):\n"
                         f"{invite.invite_link}\n\n"
-                        "Не передавай ссылку другим пользователям!"
+                        "❗️ Не передавай ссылку другим пользователям!"
                     ),
                 )
             except TelegramError:
-                # Сохраняем ссылку, чтобы администрация могла
-                # вручную передать её заявителю.
-                app["status"] = "accepted"
-                app["processed_by"] = query.from_user.id
+                app["delivery_failed"] = True
+                log_action(data, query.from_user.id, "application_accepted_delivery_failed", app["user_id"], app_id)
                 save_data(data)
-
                 await query.message.reply_text(
-                    "⚠️ Заявка одобрена, но бот не смог отправить "
-                    "ссылку пользователю. Ссылка сохранена в данных "
-                    "заявки. Проверь, доступен ли пользователю бот."
+                    "⚠️ Заявка одобрена, но бот не смог отправить ссылку. Она сохранена в карточке заявки/данных."
                 )
-
-                await query.message.edit_reply_markup(
-                    reply_markup=application_keyboard(
-                        app_id,
-                        status="accepted",
-                    )
-                )
-                return
-
-            app["status"] = "accepted"
+            else:
+                app["delivery_failed"] = False
+            log_action(data, query.from_user.id, "application_accepted", app["user_id"], app_id)
 
         else:
             app["status"] = "rejected"
-            # После отказа повторная подача заявки запрещена на 24 часа.
-            # Не сокращаем уже действующую более длительную блокировку.
+            app["processed_by"] = query.from_user.id
+            app["processed_at"] = datetime.now(timezone.utc).isoformat()
+            hours = {"reject24": 24, "reject168": 168, "rejectperm": None}[action]
+            duration_label = {"reject24": "24 часа", "reject168": "7 дней", "rejectperm": "навсегда"}[action]
             existing_block = get_user_block(data, app["user_id"])
-            should_apply_rejection_block = existing_block is None
-            if existing_block and existing_block.get("until"):
+            should_apply = existing_block is None
+            if existing_block and existing_block.get("until") and hours is None:
+                # Бессрочная блокировка заменяет временную.
+                should_apply = True
+            elif existing_block and existing_block.get("until") and hours is not None:
                 try:
                     current_until = datetime.fromisoformat(existing_block["until"])
                     if current_until.tzinfo is None:
                         current_until = current_until.replace(tzinfo=timezone.utc)
-                    should_apply_rejection_block = (
-                        current_until < datetime.now(timezone.utc) + timedelta(hours=24)
-                    )
+                    requested_until = datetime.now(timezone.utc) + timedelta(hours=hours)
+                    should_apply = current_until < requested_until
                 except (TypeError, ValueError):
-                    should_apply_rejection_block = False
-
-            if should_apply_rejection_block:
+                    should_apply = False
+            elif existing_block and not existing_block.get("until"):
+                # Уже есть бессрочная блокировка — не сокращаем её срок.
+                should_apply = False
+            if should_apply:
                 apply_user_block(
                     data,
                     app["user_id"],
-                    hours=24,
+                    hours=hours,
                     reason=f"Заявка №{app_id} отклонена",
                     blocked_by=query.from_user.id,
                 )
-
+            app["rejection_block"] = duration_label
+            log_action(data, query.from_user.id, "application_rejected", app["user_id"], app_id, f"Блокировка: {duration_label}")
             try:
                 await context.bot.send_message(
                     chat_id=app["user_id"],
                     text=(
-                        "❌ К сожалению, твоя заявка "
-                        "на вступление отклонена Администрацией.\n\n"
-                        "Повторно подать заявку можно через 24 часа."
+                        "❌ К сожалению, твоя заявка на вступление отклонена Администрацией.\n\n"
+                        f"Повторная подача заявок ограничена: {duration_label}."
                     ),
                 )
             except TelegramError:
                 pass
 
-        app["processed_by"] = query.from_user.id
         save_data(data)
-
-        await query.message.edit_reply_markup(
-            reply_markup=application_keyboard(
-                app_id,
-                status=app["status"],
-            )
+        keyboard = application_keyboard(
+            app_id,
+            status=app["status"],
+            has_invite=bool(app.get("invite_link") and not app.get("invite_revoked")),
         )
-
+        # При выборе срока отказа callback приходит из отдельного сообщения с вариантами,
+        # поэтому обновляем именно исходную карточку заявки.
+        if app.get("admin_message_id"):
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=ADMIN_CHAT_ID,
+                    message_id=app["admin_message_id"],
+                    reply_markup=keyboard,
+                )
+            except TelegramError:
+                logger.exception("Не удалось обновить карточку заявки")
+        if query.message.message_id != app.get("admin_message_id"):
+            try:
+                await query.message.edit_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
         await query.message.reply_text(
-            "✅ Заявка принята."
-            if action == "accept"
-            else "❌ Заявка отклонена."
+            "✅ Заявка одобрена." if action == "accept"
+            else f"❌ Заявка отклонена. Блокировка: {duration_label}."
         )
         return
 
     if action == "contact":
+        await query.answer()
         app["contact_mode"] = True
         app["contact_started_by"] = query.from_user.id
+        log_action(data, query.from_user.id, "contact_started", app.get("user_id"), app_id)
         save_data(data)
-
         context.user_data["admin_contact_app_id"] = app_id
-
         try:
             await context.bot.send_message(
                 chat_id=app["user_id"],
-                text=(
-                    "💬 Администрация хочет связаться с тобой "
-                    "по поводу заявки. Напиши сюда своё сообщение."
-                ),
+                text="💬 Администрация хочет связаться с тобой по поводу заявки. Напиши сюда своё сообщение.",
             )
         except TelegramError:
             await query.message.reply_text(
-                "❌ Не удалось связаться с пользователем. "
-                "Он должен открыть бота и нажать /start."
+                "❌ Не удалось связаться с пользователем. Он должен открыть бота и нажать /start."
             )
             return
-
         await query.message.reply_text(
             f"💬 Диалог по заявке №{app_id} активирован.\n"
-            "Отправляй сообщения в админ-чат — бот передаст их "
-            "пользователю.\n"
+            "Отправляй сообщения в админ-чат — бот передаст их пользователю.\n"
             "Для завершения отправь /конец."
         )
 
@@ -1039,6 +1147,7 @@ async def end_contact(
     if app:
         app["contact_mode"] = False
         app["contact_started_by"] = None
+        log_action(data, user.id, "contact_ended", app.get("user_id"), app_id)
         save_data(data)
 
         try:
@@ -1097,9 +1206,10 @@ async def block_applications_command(update, context):
         data,
         target_id,
         hours=hours,
-        reason="Блокировка администрацией",
+        reason="Блокировка Администрацией",
         blocked_by=user.id,
     )
+    log_action(data, user.id, "applications_blocked", target_id, details=format_block_expiry(block))
     await message.reply_text(
         f"🔒 Подача заявок для пользователя <code>{target_id}</code> "
         f"заблокирована.\n"
@@ -1132,6 +1242,7 @@ async def unblock_applications_command(update, context):
         int(x) for x in data.get("blocked_users", [])
         if int(x) != target_id
     ]
+    log_action(data, user.id, "applications_unblocked", target_id)
     save_data(data)
     await message.reply_text(
         f"🔓 Блокировка подачи заявок для пользователя "
@@ -1176,6 +1287,67 @@ async def list_application_bans(update, context):
     )
 
 
+async def admin_help(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not in_admin_chat(update):
+        return
+    data = get_data(context)
+    if not has_access(user.id, data):
+        await message.reply_text("❌ Доступ запрещён.")
+        return
+    await message.reply_text(
+        "🛠 <b>**ПАМЯТКА ПО ПРИНЯТИЮ ЗАЯВОК</b>\n\n"
+        "<b>📝 Заявки и шаблон</b>\n"
+        "/пмщ — показать эту памятку.\n"
+        "/шаблон Текст — изменить текст шаблона (команда владельца).\n"
+        "/шаблон_текущий — посмотреть текущий шаблон.\n"
+        "/безфото — убрать фотографию из шаблона (команда владельца).\n"
+        "/конец — завершить активный диалог с участником.\n\n"
+        "<b>🔒 Блокировки заявок</b>\n"
+        "Ответь на сообщение пользователя или карточку заявки командой /банзаявки 48 — блокировка на 48 часов.\n"
+        "/банзаявки навсегда — бессрочная блокировка.\n"
+        "/разбанзаявки — снять блокировку (ответом на пользователя/заявку).\n"
+        "/списокбанов — показать активные блокировки.\n\n"
+        "<b>📋 История</b>\n"
+        "/журнал — последние действия Администрации.\n\n"
+        "При отклонении заявки выбери срок: 24 часа, 7 дней или навсегда.\n"
+        "Команды /add и /del доступны только владельцу и не включены в эту справку.",
+        parse_mode="HTML",
+    )
+
+
+async def show_admin_log(update, context):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not in_admin_chat(update):
+        return
+    data = get_data(context)
+    if not has_access(user.id, data):
+        await message.reply_text("❌ Доступ запрещён.")
+        return
+    entries = data.get("admin_log", [])[-20:]
+    if not entries:
+        await message.reply_text("📘 Журнал пока пуст.")
+        return
+    lines = []
+    for item in reversed(entries):
+        at = item.get("at", "")
+        try:
+            dt = datetime.fromisoformat(at).astimezone()
+            at = dt.strftime("%d.%m.%Y %H:%M")
+        except (TypeError, ValueError):
+            pass
+        actor = item.get("actor_id") or "?"
+        target = item.get("target_id")
+        app_id = item.get("app_id")
+        details = f" — {esc(item['details'])}" if item.get("details") else ""
+        suffix = f"; участник <code>{target}</code>" if target else ""
+        suffix += f"; заявка №{app_id}" if app_id else ""
+        lines.append(f"• <code>{esc(at)}</code> — <b>{esc(item.get('action', 'действие'))}</b>; Администратор <code>{actor}</code>{suffix}{details}")
+    await message.reply_text("📘 <b>Последние действия Администрации</b>\n\n" + "\n".join(lines), parse_mode="HTML")
+
+
 # ============================================================
 # RUSSIAN COMMAND ROUTER
 # Русские команды обрабатываются вручную, поскольку Telegram
@@ -1194,7 +1366,11 @@ async def russian_command_router(
     text = message.text.strip()
     command = text.split(maxsplit=1)[0].split("@")[0].lower()
 
-    if command == "/шаблон":
+    if command == "/пмщ":
+        await admin_help(update, context)
+    elif command == "/журнал":
+        await show_admin_log(update, context)
+    elif command == "/шаблон":
         await set_template(update, context)
     elif command == "/шаблон_текущий":
         await show_template(update, context)
@@ -1243,7 +1419,7 @@ def main():
             filters.Chat(ADMIN_CHAT_ID)
             & filters.TEXT
             & filters.Regex(
-                r"^/(?:шаблон(?:_текущий)?|безфото|конец|"
+                r"^/(?:пмщ|журнал|шаблон(?:_текущий)?|безфото|конец|"
                 r"банзаявки|разбанзаявки|списокбанов)"
                 r"(?:@\w+)?(?:\s|$)"
             ),
